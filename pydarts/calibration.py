@@ -1,21 +1,46 @@
 from dataclasses import dataclass
-from typing import List, Union
+from typing import List, Union, Tuple
 import numpy as np
 import cv2
 import itertools as it
 from shapely.geometry import MultiLineString, LineString, Point, MultiPoint
+from scipy.optimize import minimize
+from util import rotate_anchor
+
+
 
 
 @dataclass
 class Ellipse():
     x: float = None # center x pos
     y: float = None # center y pos
-    a: float = None # semi-major axis
-    b: float = None # semi-minor axis
+    b: float = None # semi-major axis
+    a: float = None # semi-minor axis
     ang: float = None # rotation angle
 
-    def to_cv2(self):
-        return ((self.x, self.y),(self.a,self.b), self.ang)
+    def to_cv2(self) -> Tuple[Union[Tuple, float]]:
+        return ((self.x, self.y),(self.b,self.a), self.ang)
+
+    def area(self) -> float:
+        return np.pi*self.a*self.b
+
+    def get_edge_points(self) -> np.ndarray:
+        a = np.deg2rad(self.ang)
+        return np.array([[self.x-np.cos(a)*self.b/2, self.y-np.sin(a)*self.b/2],  # top
+                         [self.x+np.sin(a)*self.a/2, self.y-np.cos(a)*self.a/2],  # right
+                         [self.x+np.cos(a)*self.b/2, self.y+np.sin(a)*self.b/2],  # bottom
+                         [self.x-np.sin(a)*self.a/2, self.y+np.cos(a)*self.a/2]]) # left
+
+    def transform_edge_points(self, M: np.ndarray) -> np.array:
+        t = (M@np.column_stack((self.get_edge_points(), np.ones(4))).T).T
+        t /= t[:,2,None]
+        return t[:,:2]
+
+    def get_equalize_rotation_matrix(self) -> np.ndarray:
+        return rotate_anchor(gamma=-self.ang, x=self.x, y=self.y)
+
+    def get_ellipse_to_circle_rotation_matrix(self) -> np.ndarray:
+        return np.array([[1, 0, 0], [0, self.b/self.a, 0], [0, 0, 1]])
 
 
 @dataclass
@@ -23,22 +48,32 @@ class BullsEye():
     x: float = None
     y: float = None
 
-    def xy(self):
+    def xy(self) -> Tuple[float]:
         return (self.x, self.y)
+
+    def transform(self, M: np.ndarray) -> np.array:
+        t = (M@np.array([self.x, self.y, 1])[:,None])[:,0]
+        t /= t[2]
+        return t[:2]
 
 
 class Calibration():
 
     def __init__(self, img) -> None:
         self.image = img
-        self.cal_ellipse = Ellipse()
+        if len(img.shape) > 2:
+            self.h, self.w, self.c = img.shape
+        else:
+            self.h, self.w = img.shape
+            self.c = None
+        self.ellipse = Ellipse()
         self.bullseye = BullsEye()
 
     def preprocess_ellipse(self) -> np.ndarray:
         # convert to HSV
         hsv = cv2.cvtColor(self.image, cv2.COLOR_BGR2HSV)
         # use saturation channel for binary thresholding
-        ret, thresh = cv2.threshold(hsv[:,:,1], 150, 255, cv2.THRESH_BINARY)
+        _, thresh = cv2.threshold(hsv[:,:,1], 120, 255, cv2.THRESH_BINARY)
         # remove radial wires
         kernel_size = 10
         kernel = np.ones((kernel_size, kernel_size), np.float32) / kernel_size**2
@@ -46,20 +81,16 @@ class Calibration():
         return calib_img
 
     def ellipse_mask(self, image: np.ndarray) -> np.ndarray:
-        assert self.cal_ellipse.x, "No ellipse detected. Do the ellipse detection first."
-        if len(image.shape) > 2:
-            H, W, C = image.shape
-        else:
-            H, W = image.shape
-            C = None
-        x, y = np.meshgrid(np.arange(W), np.arange(H))
-        cost = np.cos(np.deg2rad(self.cal_ellipse.ang))
-        sint = np.sin(np.deg2rad(self.cal_ellipse.ang))
-        r = (((x-self.cal_ellipse.x)*cost+(y-self.cal_ellipse.y)*sint)**2/(self.cal_ellipse.a/2)**2)+\
-            (((x-self.cal_ellipse.x)*sint+(y-self.cal_ellipse.y)*cost)**2/(self.cal_ellipse.b/2)**2)
+        assert self.ellipse.x, "No ellipse detected. Do the ellipse detection first."
+        x, y = np.meshgrid(np.arange(self.w), np.arange(self.h))
+        cost = np.cos(np.deg2rad(self.ellipse.ang))
+        sint = np.sin(np.deg2rad(self.ellipse.ang))
+        # ellipsis equation
+        r = (((x-self.ellipse.x)*cost+(y-self.ellipse.y)*sint)**2/(self.ellipse.b/2)**2)+\
+            (((x-self.ellipse.x)*sint+(y-self.ellipse.y)*cost)**2/(self.ellipse.a/2)**2)
         mask = r <= 1
-        if C:
-            image[np.where(~mask)] = np.zeros(C, dtype=int)
+        if len(image.shape) > 2:
+            image[np.where(~mask)] = np.zeros(image.shape[2], dtype=int)
         else:
             image[np.where(~mask)] = 0
         return image
@@ -85,9 +116,9 @@ class Calibration():
             raise("No calibration ellipse found. Please check the webcam.")
         # set ellipse with largest area as calibration ellipse
         ellipse = ellipses[np.argmax(areas)]
-        self.cal_ellipse = Ellipse(
+        self.ellipse = Ellipse(
                             x=ellipse[0][0], y=ellipse[0][1],
-                            a=ellipse[1][0], b=ellipse[1][1],
+                            b=ellipse[1][0], a=ellipse[1][1],
                             ang=ellipse[2]
                             )
 
@@ -95,7 +126,7 @@ class Calibration():
         # convert to HSV
         hsv = cv2.cvtColor(self.image, cv2.COLOR_BGR2HSV)
         # use value channel for binary thresholding
-        ret, thresh = cv2.threshold(hsv[:,:,2], 150, 255, cv2.THRESH_BINARY)
+        ret, thresh = cv2.threshold(hsv[:,:,2], 120, 255, cv2.THRESH_BINARY)
         # mask area outside the dartsboard ellipses
         thresh = self.ellipse_mask(thresh)
         # apply Canny edge detection
@@ -106,11 +137,13 @@ class Calibration():
         # preprocess image
         canny = self.preprocess_wires()
         # Hough line detection
-        lines = cv2.HoughLines(canny, rho=2, theta=np.pi / 80, threshold=100)
+        lines = cv2.HoughLines(canny, rho=2, theta=2*np.pi/360, threshold=100)
         # find all intersection points of the 10 most important lines
         maxshape = np.max(self.image.shape)
         l = []
+        angles = []
         for dist, angle in lines[:10,0]:
+            angles.append(angle)
             (x0, y0) = dist * np.array([np.cos(angle), np.sin(angle)])
             dir_v = np.array([np.cos(angle+np.pi/2), np.sin(angle+np.pi/2)])
             xs, ys = np.array([x0, y0]) - dir_v*maxshape
@@ -127,38 +160,35 @@ class Calibration():
         self.bullseye.x = c[0][0]
         self.bullseye.y = c[1][0]
         if return_lines:
-            return m
+            return m, angles
 
-    def transform_image(self):
-        assert self.cal_ellipse, "Find ellipse first."
-        cos_t = np.cos(np.deg2rad(self.cal_ellipse.ang))
-        sin_t = np.sin(np.deg2rad(self.cal_ellipse.ang))
-        #x = self.cal_ellipse.x
-        x = self.bullseye.x
-        #y = self.cal_ellipse.y
-        y = self.bullseye.y
-        a = self.cal_ellipse.a
-        b = self.cal_ellipse.b
+    def __opt_rotation(self, phi: float, bullseye_rot: np.array, M1: np.ndarray) -> float:
+        M2 = rotate_anchor(phi=phi, x=bullseye_rot[0], y=bullseye_rot[1])
+        ell_edge_rot = self.ellipse.transform_edge_points(M2@M1)
+        # calculate distances from Bull's Eye to left and right ellipse edges
+        dists = np.sqrt(np.sum((ell_edge_rot[[0,2]]-bullseye_rot)**2, axis=1))
+        # loss = squared difference between distances
+        return np.diff(dists)[0]**2
 
-        R1 = np.array([ [cos_t,  sin_t,   0],
-                        [-sin_t, cos_t,   0],
-                        [0,      0,       1]])
-        R2 = np.array([ [cos_t, -sin_t,   0],
-                        [sin_t,  cos_t,   0],
-                        [0,      0,       1]])
-        T1 = np.array([ [1,      0,      -x],
-                        [0,      1,      -y],
-                        [0,      0,       1]])
-        T2 = np.array([ [1,      0,       x],
-                        [0,      1,       y],
-                        [0,      0,       1]])
-        D  = np.array([ [1,      0,       0],
-                        [0,      a/b,     0],
-                        [0,      0,       1]])
+    def transform_to_circle(self) -> np.ndarray:
+        assert self.ellipse.x, "Find ellipse first."
+        assert self.bullseye.x, "Find Bull's Eye first."
+        # Step 1 - equalize ellipsis rotation
+        M1 = self.ellipse.get_equalize_rotation_matrix()
+        # Step 2 - rotate ellipse, so that Bull's Eye is in the ellipse center calculate new bulleye coordinates and ellipse edge points
+        bullseye_rot = self.bullseye.transform(M1)
+        #   vectorize loss function
+        opt_func = np.vectorize(lambda phi: self.__opt_rotation(phi, bullseye_rot=bullseye_rot, M1=M1))
+        res = minimize(opt_func, x0=0, bounds=[(-0.05,0.05)])
+        print(res)
+        if not res.success:
+            raise "Cannot rotate dartsboard correctly."
+        #   result = best phi for rotation matrix M2
+        M2 = rotate_anchor(phi=res.x[0], x=bullseye_rot[0], y=bullseye_rot[1])
+        # Step 3 - transform ellipse to circle
+        M3 = self.ellipse.get_ellipse_to_circle_rotation_matrix()
 
-        M = T2@R2@D@R1@T1
-
-        return M
+        return M3@M2@M1
 
     def do(self) -> None:
         self.find_ellipse()
