@@ -8,14 +8,12 @@ from scipy.optimize import minimize
 from util import rotate_anchor
 
 
-
-
 @dataclass
 class Ellipse():
     x: float = None # center x pos
     y: float = None # center y pos
-    b: float = None # semi-major axis
-    a: float = None # semi-minor axis
+    a: float = None # semi-major axis
+    b: float = None # semi-minor axis
     ang: float = None # rotation angle
 
     def to_cv2(self) -> Tuple[Union[Tuple, float]]:
@@ -82,18 +80,10 @@ class Calibration():
 
     def ellipse_mask(self, image: np.ndarray) -> np.ndarray:
         assert self.ellipse.x, "No ellipse detected. Do the ellipse detection first."
-        x, y = np.meshgrid(np.arange(self.w), np.arange(self.h))
-        cost = np.cos(np.deg2rad(self.ellipse.ang))
-        sint = np.sin(np.deg2rad(self.ellipse.ang))
-        # ellipsis equation
-        r = (((x-self.ellipse.x)*cost+(y-self.ellipse.y)*sint)**2/(self.ellipse.b/2)**2)+\
-            (((x-self.ellipse.x)*sint+(y-self.ellipse.y)*cost)**2/(self.ellipse.a/2)**2)
-        mask = r <= 1
-        if len(image.shape) > 2:
-            image[np.where(~mask)] = np.zeros(image.shape[2], dtype=int)
-        else:
-            image[np.where(~mask)] = 0
-        return image
+        mask = np.zeros_like(image)
+        mask = cv2.ellipse(mask, self.ellipse.to_cv2(), (255,255,255), -1)
+        masked_image = np.bitwise_and(image, mask)
+        return masked_image
 
     def find_ellipse(self) -> List[Ellipse]:
         # preprocess image
@@ -118,7 +108,7 @@ class Calibration():
         ellipse = ellipses[np.argmax(areas)]
         self.ellipse = Ellipse(
                             x=ellipse[0][0], y=ellipse[0][1],
-                            b=ellipse[1][0], a=ellipse[1][1],
+                            a=ellipse[1][1], b=ellipse[1][0],
                             ang=ellipse[2]
                             )
 
@@ -170,7 +160,7 @@ class Calibration():
         # loss = squared difference between distances
         return np.diff(dists)[0]**2
 
-    def transform_to_circle(self) -> np.ndarray:
+    def transform_to_circle(self, image: np.ndarray) -> Union[np.ndarray, np.ndarray]:
         assert self.ellipse.x, "Find ellipse first."
         assert self.bullseye.x, "Find Bull's Eye first."
         # Step 1 - equalize ellipsis rotation
@@ -180,15 +170,24 @@ class Calibration():
         #   vectorize loss function
         opt_func = np.vectorize(lambda phi: self.__opt_rotation(phi, bullseye_rot=bullseye_rot, M1=M1))
         res = minimize(opt_func, x0=0, bounds=[(-0.05,0.05)])
-        print(res)
         if not res.success:
             raise "Cannot rotate dartsboard correctly."
         #   result = best phi for rotation matrix M2
         M2 = rotate_anchor(phi=res.x[0], x=bullseye_rot[0], y=bullseye_rot[1])
         # Step 3 - transform ellipse to circle
         M3 = self.ellipse.get_ellipse_to_circle_rotation_matrix()
+        # Done.
+        M = M3@M2@M1
+        # Warp image with resulting transformation matrix
+        t_img = cv2.warpPerspective(self.ellipse_mask(image), M, (image.shape[:2][::-1]))
+        # find bounding box in grayscale image
+        gray = cv2.cvtColor(t_img.copy(),cv2.COLOR_BGR2GRAY) 
+        contours, hierarchy = cv2.findContours(gray, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)[-2:]
+        bbx, bby, bbw, bbh = cv2.boundingRect(contours[-1])
+        # crop to found bounding box and rescale to standard size
+        transformed_image = cv2.resize(t_img[bby:bby+bbh,bbx:bbx+bbw], dsize=(2000,2000), interpolation=cv2.INTER_CUBIC)
 
-        return M3@M2@M1
+        return transformed_image, M
 
     def do(self) -> None:
         self.find_ellipse()
